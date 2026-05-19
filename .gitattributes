@@ -1,2 +1,0 @@
-LucidDreamer filter=lfs diff=lfs merge=lfs -text
-LucidDreamer.zip filter=lfs diff=lfs merge=lfs -text

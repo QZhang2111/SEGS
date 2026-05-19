@@ -29,10 +29,15 @@ env/
 conda-meta/
 
 # Recovered/local upstream artifacts; keep out of public repo
+.gitattributes
 LucidDreamer/
 LucidDreamer.zip
 PCA_LucidDreamer.zip
 *.zip
+run_LucidDreamer.py
+readme
+prompts_with_heads.json
+simplified_prompts.json
 
 # Local agent planning notes
 docs/superpowers/
