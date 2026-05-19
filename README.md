@@ -115,18 +115,6 @@ Not included yet:
 - Reproduction scripts for every baseline reported in the paper.
 - Precomputed PCA reference files or model checkpoints.
 
-## Citation
-
-If this repository is useful, please cite:
-
-```bibtex
-@article{zhang2026segs,
-  title  = {Structural Energy Guidance for View-Consistent Text-to-3D Generation},
-  author = {Zhang, Qing and Tong, Jinguang and Zhang, Jing and Hong, Jie and Li, Xuesong},
-  year   = {2026}
-}
-```
-
 ## License
 
 This repository is released under the MIT License. See [LICENSE](LICENSE).
