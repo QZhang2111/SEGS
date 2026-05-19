@@ -34,6 +34,9 @@ LucidDreamer.zip
 PCA_LucidDreamer.zip
 *.zip
 
+# Local agent planning notes
+docs/superpowers/
+
 # Generated SEGS data and experiment outputs
 pca_output/
 pca_result/
