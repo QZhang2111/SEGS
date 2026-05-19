@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import StableDiffusionPipeline
 from help import prep_unet_attention, patch_target_conv_block, clean_attn_buffer, get_module_by_name
+from segs.structural_energy import mean_teacher_features
 
 class PCACFGPipeline(StableDiffusionPipeline):
     def load_pca_info(self, pca_file: str):
@@ -22,7 +23,7 @@ class PCACFGPipeline(StableDiffusionPipeline):
         max_pca_steps=20,
         pca_guidance_scale=1000.0,
         generator=None,
-        num_samples_per_group=20,
+        num_samples_per_group=3,
         feature_dim=64,
     ):
         device = self._execution_device
@@ -81,7 +82,11 @@ class PCACFGPipeline(StableDiffusionPipeline):
                         
                         # 计算 teacher_feat_mean
                         teacher_feat_ = pca_data["teacher_feature"].to(device)
-                        teacher_feat_mean = teacher_feat_.view(-1, num_samples_per_group, feature_dim).mean(dim=1)
+                        teacher_feat_mean = mean_teacher_features(
+                            teacher_feat_,
+                            topk=num_samples_per_group,
+                            tokens_per_sample=proj.shape[0],
+                        )
                         
                         # 计算损失（对于两种情况均使用 MSE 损失）
                         loss = F.mse_loss(proj, teacher_feat_mean)
@@ -108,7 +113,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", type=str, default="a corgi is running, back view")
     parser.add_argument("--pca_file", type=str, default="PCA_extraction/20_seed_image_pca64/pca_results.pt")
-    parser.add_argument("--num_samples_per_group", type=int, default=20, help="每组样本数")
+    parser.add_argument("--num_samples_per_group", type=int, default=3, help="每组样本数")
     parser.add_argument("--feature_dim", type=int, default=64, help="特征维度")
     args = parser.parse_args()
 

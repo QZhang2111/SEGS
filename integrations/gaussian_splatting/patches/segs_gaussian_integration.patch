@@ -1,0 +1,1089 @@
+diff --git a/guidance/pca_helpers.py b/guidance/pca_helpers.py
+new file mode 100644
+index 0000000..7537c17
+--- /dev/null
++++ b/guidance/pca_helpers.py
+@@ -0,0 +1,370 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++from diffusers.models.attention_processor import AttnProcessor2_0
++"""
++统一后的辅助函数文件，包含以下功能：
++  1. patch_target_conv_block：为指定卷积层打补丁，
++     在执行 conv1 后保存中间特征。特征保存方式可通过参数控制是否 detach（以及是否移动到 CPU）。
++  2. MySelfAttnProcessor：自定义 Attention Processor，
++     在 self-attention 场景下提取 key 特征，并转换为 [B, C, H, W] 形状。
++  3. prep_unet_attention：遍历 UNet 模型，替换所有 Attention 模块的处理器为 MySelfAttnProcessor，
++     并可通过参数控制是否对 key 特征 detach。
++  4. clean_attn_buffer：清理 Attention 模块中保存的中间变量（如 key）和卷积层保存的 feature。
++  5. get_module_by_name：通过名称查找模型中的子模块。
++  6. visualize_and_save_features_pca：对输入特征做 PCA 降维到 3 维后保存为图像。
++  7. compute_pca_for_storage：对输入特征做 PCA，并返回均值、主成分和投影后的特征。
++  8. classify_blocks：判断给定层名称是否包含关键字列表中的任一字符串。
++  
++该文件通过参数化方式统一了两份代码中的不同实现，既支持离线特征提取也支持梯度计算场景。
++"""
++
++import math
++import os
++import torch
++import xformers
++from diffusers.models.attention_processor import Attention
++from typing import Optional
++
++# ---------------------------
++# 辅助函数：通过名称查找子模块
++# ---------------------------
++def get_module_by_name(model, module_name: str):
++    """
++    在 model.named_modules() 中根据完整名称检索子模块。
++    如果找不到则返回 None。
++    """
++    for n, m in model.named_modules():
++        if n == module_name:
++            return m
++    return None
++
++# ---------------------------
++# 统一后的 patch_target_conv_block 函数
++# ---------------------------
++def patch_target_conv_block(unet, module_name: str = None, detach_feature: bool = True):
++    """
++    为目标卷积层打补丁，修改其 forward 方法，在 conv1 后保存中间特征到 module.feature。
++    
++    参数:
++      unet: 模型
++      module_name: 若提供则通过 get_module_by_name 查找目标模块；
++                   若为 None，则默认使用 unet.up_blocks[1].resnets[1]
++      detach_feature: 若 True，则保存时使用 hidden.detach().cpu()（适用于离线特征提取）；
++                      若 False，则直接保存 hidden（保留梯度）。
++    """
++    if module_name is not None:
++        conv_module = get_module_by_name(unet, module_name)
++        if conv_module is None:
++            raise ValueError(f"未能在 unet 中找到名为 {module_name} 的卷积层模块，请检查名称是否正确。")
++    else:
++        try:
++            conv_module = unet.up_blocks[1].resnets[1]
++        except Exception as e:
++            raise ValueError("无法通过默认路径 unet.up_blocks[1].resnets[1] 获取目标模块，请提供 module_name 参数。") from e
++
++    original_forward = conv_module.forward  # 如果需要保留原始 forward 可保存
++
++    def conv_forward(x, temb=None):
++        hidden = conv_module.norm1(x)
++        hidden = conv_module.nonlinearity(hidden)
++        if hasattr(conv_module, "upsample") and conv_module.upsample is not None:
++            x = conv_module.upsample(x)
++            hidden = conv_module.upsample(hidden)
++        # 执行 conv1 提取特征
++        hidden = conv_module.conv1(hidden)
++        if detach_feature:
++            conv_module.feature = hidden.detach().cpu()
++        else:
++            conv_module.feature = hidden
++        if temb is not None and hasattr(conv_module, "time_emb_proj"):
++            temb_proj = conv_module.time_emb_proj(conv_module.nonlinearity(temb))[:, :, None, None]
++            hidden = hidden + temb_proj
++        hidden = conv_module.norm2(hidden)
++        hidden = conv_module.nonlinearity(hidden)
++        hidden = conv_module.dropout(hidden)
++        hidden = conv_module.conv2(hidden)
++        if hasattr(conv_module, "conv_shortcut") and conv_module.conv_shortcut is not None:
++            x = conv_module.conv_shortcut(x)
++        output = (x + hidden) / conv_module.output_scale_factor
++        return output
++
++    conv_module.forward = conv_forward
++    return unet
++
++
++# 统一后的 classify_blocks 函数
++# ---------------------------
++def classify_blocks(block_list, name: str):
++    """
++    判断给定层名称 name 是否包含 block_list 中的任意一个字符串。
++    """
++    for block in block_list:
++        if block in name:
++            return True
++    return False
++
++# ---------------------------
++# 统一后的 MySelfAttnProcessor 类
++# ---------------------------
++# help.py 中的注意力处理器修改部分
++# help.py 中的 HybridAttnProcessor 类修改
++
++class HybridAttnProcessor(AttnProcessor2_0):
++    def __init__(self, 
++                attention_op=None,
++                is_target_block=False,
++                detach_key=True,
++                target_word_idx=None,
++                boost_factor=1.2):
++        super().__init__()
++        self.attention_op = attention_op
++        self.is_target_block = is_target_block
++        self.detach_key = detach_key
++
++        self.target_word_idx = target_word_idx
++        self.boost_factor = boost_factor
++        self.k = None
++
++    def set_boost_factor(self, new_boost: float):
++        """动态更新注意力增强系数"""
++        assert isinstance(new_boost, (int, float)), "Boost factor must be numeric"
++        self.boost_factor = max(new_boost, 1.0)  # 保证最小增强系数为1.0
++
++    def set_target_index(self, new_index: int):
++        """动态更新目标token的位置索引"""
++        if new_index is not None:
++            assert isinstance(new_index, int), "Target index must be integer"
++            assert new_index >= 0, "Index cannot be negative"
++        self.target_word_idx = new_index
++
++    def get_weight(self):
++        return self.boost_factor
++    def get_index(self):
++        return self.target_word_idx
++
++
++    def __call__(self, attn, hidden_states, encoder_hidden_states=None, **kwargs):
++        # 自注意力处理
++        if encoder_hidden_states is None:
++            if self.is_target_block:
++                return self._self_attn_forward(attn, hidden_states, **kwargs)
++            return super().__call__(attn, hidden_states, None, **kwargs)
++        
++        # 交叉注意力处理（添加kwargs传递）
++        return self._cross_attn_forward(attn, hidden_states, encoder_hidden_states, **kwargs)
++
++
++    def _self_attn_forward(self,
++                          attn: Attention,
++                          hidden_states: torch.Tensor,
++                          attention_mask: Optional[torch.Tensor],
++                          temb=None, scale: float = 1.0):
++        """整合正确自注意力处理逻辑"""
++        residual = hidden_states
++        
++        # 空间归一化处理
++        if attn.spatial_norm is not None:
++            hidden_states = attn.spatial_norm(hidden_states, temb)
++
++        input_ndim = hidden_states.ndim
++        
++        # 4D输入处理
++        batch_size = hidden_states.shape[0]
++        if input_ndim == 4:
++            batch_size, channel, height, width = hidden_states.shape
++            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
++
++        # 准备注意力掩码
++        key_tokens = hidden_states.shape[1]
++        attention_mask = attn.prepare_attention_mask(attention_mask, key_tokens, batch_size)
++        if attention_mask is not None:
++            query_tokens = hidden_states.shape[1]
++            attention_mask = attention_mask.expand(-1, query_tokens, -1)
++
++        # 分组归一化
++        if attn.group_norm is not None:
++            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
++
++        # 投影计算
++        query = attn.to_q(hidden_states)
++        key = attn.to_k(hidden_states)
++        value = attn.to_v(hidden_states)
++
++        # 多头处理
++        query_ = attn.head_to_batch_dim(query).contiguous()
++        key_ = attn.head_to_batch_dim(key).contiguous()
++        value_ = attn.head_to_batch_dim(value)
++
++        # Xformers注意力计算
++        hidden_states_ = xformers.ops.memory_efficient_attention(
++            query_, key_, value_,
++            attn_bias=attention_mask,
++            op=self.attention_op,
++            scale=scale * attn.scale
++        )
++
++        # 输出处理
++        hidden_states_ = hidden_states_.to(query_.dtype)
++        hidden_states_ = attn.batch_to_head_dim(hidden_states_)
++        hidden_states_ = attn.to_out[0](hidden_states_)
++        hidden_states_ = attn.to_out[1](hidden_states_)
++
++        # 恢复4D形状
++        if input_ndim == 4:
++            hidden_states_ = hidden_states_.transpose(-1, -2).reshape(batch_size, channel, height, width)
++
++        # 残差连接
++        if attn.residual_connection:
++            hidden_states_ += residual
++        hidden_states_ /= attn.rescale_output_factor
++
++        # 保存关键特征
++        b, tokens, dim = key.shape
++        res = int(math.sqrt(tokens))
++        self.k = key.permute(0, 2, 1).reshape(b, dim, res, res)
++        if self.detach_key:
++            self.k = self.k.detach()
++
++        return hidden_states_
++
++    def _cross_attn_forward(self, 
++                          attn, 
++                          hidden_states, 
++                          encoder_hidden_states,
++                          attention_mask=None,
++                          temb=None,
++                          **kwargs):
++        """修正后的交叉注意力前向传播"""
++        # 使用父类处理基础逻辑
++        output = super().__call__(
++            attn, 
++            hidden_states, 
++            encoder_hidden_states=encoder_hidden_states,
++            attention_mask=attention_mask,
++            temb=temb,
++            **kwargs
++        )
++        
++        # 仅当目标模块时执行增强
++        if self.target_word_idx is not None:
++            return self._apply_token_boost(
++                attn, 
++                hidden_states, 
++                encoder_hidden_states,
++                attention_mask
++            )
++        return output
++
++    def _apply_token_boost(self, 
++                          attn,
++                          hidden_states,
++                          encoder_hidden_states,
++                          attention_mask):
++        """添加attention_mask处理"""
++        query = attn.to_q(hidden_states)
++        key = attn.to_k(encoder_hidden_states)
++        value = attn.to_v(encoder_hidden_states)
++
++        # 多头拆分
++        batch_size, seq_len, _ = query.shape
++        head_dim = query.shape[-1] // attn.heads
++        
++        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++
++        # 计算注意力得分（添加mask处理）
++        attn_scores = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(head_dim)
++        if attention_mask is not None:
++            attn_scores += attention_mask
++
++        attn_weights = torch.softmax(attn_scores, dim=-1)
++        
++        # 增强目标token权重
++        attn_scores[..., self.target_word_idx] *= self.boost_factor
++        
++        # 重新归一化
++        
++        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
++        
++        # 计算输出
++        hidden_states = torch.matmul(attn_weights, value)
++        hidden_states = hidden_states.transpose(1, 2).reshape(
++            batch_size, -1, attn.heads * head_dim)
++        hidden_states = attn.to_out[0](hidden_states)
++        hidden_states = attn.to_out[1](hidden_states)
++        
++        return hidden_states
++
++def prep_unet_attention(unet, detach_key=True, target_blocks=None, target_word_idx=None, boost_factor=1.2):
++    # 初始化记录列表
++
++    for name, module in unet.named_modules():
++        if isinstance(module, Attention):
++            # 判断是否为自注意力目标模块
++            is_self_attn_target = (
++                classify_blocks(target_blocks, name) 
++                if target_blocks 
++                else False
++            )
++            
++            # 设置处理器
++            new_processor = HybridAttnProcessor(
++                is_target_block=is_self_attn_target,
++                detach_key=detach_key,
++                target_word_idx=target_word_idx if is_self_attn_target else None,
++                boost_factor=boost_factor
++            )
++            module.set_processor(new_processor)
++            
++           
++    
++    return new_processor
++
++def get_back_token_index(guidance_system, base_prompt: str) -> int:
++    """
++    在固定格式的prompt中精准定位独立"back"词汇的位置
++    :param guidance_system: 包含tokenizer的SD系统对象
++    :param base_prompt: 原始prompt（需确保格式为"..., back view"）
++    :return: "back"在token序列中的索引位置
++    """
++    # 构造固定格式prompt
++    formatted_prompt = f"{base_prompt}, back view"
++    
++    # Tokenize处理
++    inputs = guidance_system.tokenizer(
++        formatted_prompt,
++        padding="max_length",
++        max_length=guidance_system.tokenizer.model_max_length,
++        return_tensors="pt",
++        truncation=True
++    ).to(guidance_system.device)
++    
++    # 转换为可读token列表
++    tokens = guidance_system.tokenizer.convert_ids_to_tokens(inputs.input_ids[0])
++    
++    target_word = "back"
++    # 精准定位逻辑
++    for i, token in enumerate(tokens):
++        #print("token is:", token)
++        # 匹配独立"back"且后接"view"
++        if target_word in token:
++            return i
++    
++    raise ValueError(f"Independent 'back' not found in formatted prompt: {formatted_prompt}")
++
++# ---------------------------
++# 统一后的 clean_attn_buffer 函数
++# ---------------------------
++def clean_attn_buffer(unet):
++    """
++    清除 UNet 中 Attention 模块 processor 内保存的中间变量，
++    并清理所有卷积层的 feature 属性。
++    """
++    for name, module in unet.named_modules():
++        if isinstance(module, Attention) and hasattr(module, "processor"):
++            for attr in ["hidden_state", "query", "key", "value", "attention_mask", "attn", "k"]:
++                if hasattr(module.processor, attr):
++                    setattr(module.processor, attr, None)
++        if hasattr(module, "feature"):
++            module.feature = None
+diff --git a/guidance/sd_utils.py b/guidance/sd_utils.py
+index 41aafe7..edd45df 100644
+--- a/guidance/sd_utils.py
++++ b/guidance/sd_utils.py
+@@ -23,6 +23,11 @@ from torch.cuda.amp import custom_bwd, custom_fwd
+ from .perpneg_utils import weighted_perpendicular_aggregator
+ 
+ from .sd_step import *
++from .pca_helpers import *
++from segs.structural_energy import mean_teacher_features
++from segs.view_utils import structural_guidance_weight
++import open_clip
++import pyiqa 
+ 
+ def rgb2sat(img, T=None):
+     max_ = torch.max(img, dim=1, keepdim=True).values + 1e-5
+@@ -32,6 +37,17 @@ def rgb2sat(img, T=None):
+         sat = (1 - T) * sat
+     return sat
+ 
++def classify_view(angle):
++    # 将 angle 转换到 -180~180 范围（可视需求决定），有些情况下可能你已经保证 angle 就在此范围
++    # angle = ((angle + 180) % 360) - 180  # 如果需要映射，可解注释
++    if -60 < angle < 60:
++        return "front"
++    elif (60 <= angle < 120) or (-120 < angle <= -60):
++        return "side"
++    else:
++        return "back"
++
++
+ class SpecifyGradient(torch.autograd.Function):
+     @staticmethod
+     @custom_fwd
+@@ -137,6 +153,25 @@ class StableDiffusion(nn.Module):
+                     [-0.184, -0.271, -0.473]
+                 ], device=self.device)
+         
++                # 定义图像预处理
++        self.tensor_preprocess = T.Compose([
++            T.Resize((224, 224)),  # 调整到 CLIP 的输入大小
++            T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
++        ])
++
++         #加载 CLIP 模型和 Tokenizer
++        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms('hf-hub:laion/CLIP-ViT-H-14-laion2B-s32B-b79K')
++        self.clip_model.eval()
++        self.clip_model = self.clip_model.half()
++        self.clip_model.to(self.device)
++
++        self.clip_tokenizer = open_clip.get_tokenizer('hf-hub:laion/CLIP-ViT-H-14-laion2B-s32B-b79K')
++
++        self.brisque_list=[]
++        self.brisque_low_count = 0
++        
++        print(f'[INFO] loaded open clip!')
++
+ 
+         print(f'[INFO] loaded stable diffusion!')
+ 
+@@ -156,6 +191,15 @@ class StableDiffusion(nn.Module):
+             cur_c += channels[i]
+         return (ten for ten in results)
+ 
++
++    def load_pca_info(self, pca_file: str):
++        """
++        加载 PCA 信息文件 (xxx.pt)，将其存储到模型的属性中。
++        """
++        self.pca_info = torch.load(pca_file)  # 例如 self.pca_info 是一个 dict
++        print(f"PCA info loaded from {pca_file}.")
++
++
+     def add_noise_with_cfg(self, latents, noise, 
+                            ind_t, ind_prev_t, 
+                            text_embeddings=None, cfg=1.0, 
+@@ -221,134 +265,37 @@ class StableDiffusion(nn.Module):
+         embeddings = self.text_encoder(inputs.input_ids.to(self.device))[0]
+         return embeddings
+ 
+-    def train_step_perpneg(self, text_embeddings, pred_rgb, pred_depth=None, pred_alpha=None,
+-                           grad_scale=1,use_control_net=False,
+-                           save_folder:Path=None, iteration=0, warm_up_rate = 0, weights = 0, 
+-                           resolution=(512, 512), guidance_opt=None,as_latent=False, embedding_inverse = None):
+-
++    
++    def train_step(self, text_embeddings, pred_rgb, pred_depth=None, pred_alpha=None,
++                    grad_scale=1,use_control_net=False,
++                    save_folder:Path=None, iteration=0, warm_up_rate = 0,
++                    resolution=(512, 512), guidance_opt=None,as_latent=False, embedding_inverse = None,azimuth=0):
+ 
+-        # flip aug
+         pred_rgb, pred_depth, pred_alpha = self.augmentation(pred_rgb, pred_depth, pred_alpha)
+ 
+-        B = pred_rgb.shape[0]
+-        K = text_embeddings.shape[0] - 1
+-
+-        if as_latent:      
+-            latents,_ = self.encode_imgs(pred_depth.repeat(1,3,1,1).to(self.precision_t))
+-        else:
+-            latents,_ = self.encode_imgs(pred_rgb.to(self.precision_t))
+-        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
+-        
+-        weights = weights.reshape(-1)
+-        noise = torch.randn((latents.shape[0], 4, resolution[0] // 8, resolution[1] // 8, ), dtype=latents.dtype, device=latents.device, generator=self.noise_gen) + 0.1 * torch.randn((1, 4, 1, 1), device=latents.device).repeat(latents.shape[0], 1, 1, 1)
+-
+-        inverse_text_embeddings = embedding_inverse.unsqueeze(1).repeat(1, B, 1, 1).reshape(-1, embedding_inverse.shape[-2], embedding_inverse.shape[-1])
+-
+-        text_embeddings = text_embeddings.reshape(-1, text_embeddings.shape[-2], text_embeddings.shape[-1]) # make it k+1, c * t, ...
+-
+-        if guidance_opt.annealing_intervals:
+-            current_delta_t =  int(guidance_opt.delta_t + np.ceil((warm_up_rate)*(guidance_opt.delta_t_start - guidance_opt.delta_t)))
+-        else:
+-            current_delta_t =  guidance_opt.delta_t
+-
+-        ind_t = torch.randint(self.min_step, self.max_step + int(self.warmup_step*warm_up_rate), (1, ), dtype=torch.long, generator=self.noise_gen, device=self.device)[0]
+-        ind_prev_t = max(ind_t - current_delta_t, torch.ones_like(ind_t) * 0)
+-
+-        t = self.timesteps[ind_t]
+-        prev_t = self.timesteps[ind_prev_t]
+-
+-        with torch.no_grad():
+-            # step unroll via ddim inversion
+-            if not self.ism:
+-                prev_latents_noisy = self.scheduler.add_noise(latents, noise, prev_t)
+-                latents_noisy = self.scheduler.add_noise(latents, noise, t)
+-                target = noise
+-            else:
+-                # Step 1: sample x_s with larger steps
+-                xs_delta_t = guidance_opt.xs_delta_t if guidance_opt.xs_delta_t is not None else current_delta_t
+-                xs_inv_steps = guidance_opt.xs_inv_steps if guidance_opt.xs_inv_steps is not None else int(np.ceil(ind_prev_t / xs_delta_t))
+-                starting_ind = max(ind_prev_t - xs_delta_t * xs_inv_steps, torch.ones_like(ind_t) * 0)
+-
+-                _, prev_latents_noisy, pred_scores_xs = self.add_noise_with_cfg(latents, noise, ind_prev_t, starting_ind, inverse_text_embeddings, 
+-                                                                                guidance_opt.denoise_guidance_scale, xs_delta_t, xs_inv_steps, eta=guidance_opt.xs_eta)
+-                # Step 2: sample x_t
+-                _, latents_noisy, pred_scores_xt = self.add_noise_with_cfg(prev_latents_noisy, noise, ind_t, ind_prev_t, inverse_text_embeddings, 
+-                                                                           guidance_opt.denoise_guidance_scale, current_delta_t, 1, is_noisy_latent=True)        
+-
+-                pred_scores = pred_scores_xt + pred_scores_xs
+-                target = pred_scores[0][1]
++        process_images_folder = os.path.join(save_folder, "process_images")
++        os.makedirs(process_images_folder, exist_ok=True)
++    
++        process_path = os.path.join(process_images_folder, f"{iteration}.jpg")
++    
++        # 保存当前渲染的图像; 如果 batch>1, 则会把多张图拼接到一张图中
++        save_image(pred_rgb, process_path)
+ 
++        brisque_metric = pyiqa.create_metric('brisque', device=pred_rgb.device)
++        temp_pred = pred_rgb.clamp(0, 1)  # 关键修复：限制数值范围
+ 
++        # 调整维度顺序（如果必要）并添加批次维度
++        if temp_pred.dim() == 3:
++            temp_pred = temp_pred.unsqueeze(0)  # 直接添加批次维度
++        
++            
++        # 计算质量分数（BRISQUE 分数越低表示质量越好）
+         with torch.no_grad():
+-            latent_model_input = latents_noisy[None, :, ...].repeat(1 + K, 1, 1, 1, 1).reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, )
+-            tt = t.reshape(1, 1).repeat(latent_model_input.shape[0], 1).reshape(-1)
+-
+-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, tt[0])
+-            if use_control_net:
+-                pred_depth_input = pred_depth_input[None, :, ...].repeat(1 + K, 1, 3, 1, 1).reshape(-1, 3, 512, 512).half()
+-                down_block_res_samples, mid_block_res_sample = self.controlnet_depth(
+-                    latent_model_input,
+-                    tt,
+-                    encoder_hidden_states=text_embeddings,
+-                    controlnet_cond=pred_depth_input,
+-                    return_dict=False,
+-                )
+-                unet_output = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings,
+-                                    down_block_additional_residuals=down_block_res_samples,
+-                                    mid_block_additional_residual=mid_block_res_sample).sample
+-            else:
+-                unet_output = self.unet(latent_model_input.to(self.precision_t), tt.to(self.precision_t), encoder_hidden_states=text_embeddings.to(self.precision_t)).sample
+-
+-            unet_output = unet_output.reshape(1 + K, -1, 4, resolution[0] // 8, resolution[1] // 8, )
+-            noise_pred_uncond, noise_pred_text = unet_output[:1].reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, ), unet_output[1:].reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, )
+-            delta_noise_preds = noise_pred_text - noise_pred_uncond.repeat(K, 1, 1, 1)
+-            delta_DSD = weighted_perpendicular_aggregator(delta_noise_preds,\
+-                                                            weights,\
+-                                                            B)     
+-
+-        pred_noise = noise_pred_uncond + guidance_opt.guidance_scale * delta_DSD
+-        w = lambda alphas: (((1 - alphas) / alphas) ** 0.5)
+-
+-        grad = w(self.alphas[t]) * (pred_noise - target)
++            brisque_score = brisque_metric(temp_pred)
+         
+-        grad = torch.nan_to_num(grad_scale * grad)
+-        loss = SpecifyGradient.apply(latents, grad)
+-
+-        if iteration % guidance_opt.vis_interval == 0:
+-            noise_pred_post = noise_pred_uncond + guidance_opt.guidance_scale * delta_DSD    
+-            lat2rgb = lambda x: torch.clip((x.permute(0,2,3,1) @ self.rgb_latent_factors.to(x.dtype)).permute(0,3,1,2), 0., 1.)
+-            save_path_iter = os.path.join(save_folder,"iter_{}_step_{}.jpg".format(iteration,prev_t.item()))
+-            with torch.no_grad():
+-                pred_x0_latent_sp = pred_original(self.scheduler, noise_pred_uncond, prev_t, prev_latents_noisy)    
+-                pred_x0_latent_pos = pred_original(self.scheduler, noise_pred_post, prev_t, prev_latents_noisy)        
+-                pred_x0_pos = self.decode_latents(pred_x0_latent_pos.type(self.precision_t))
+-                pred_x0_sp = self.decode_latents(pred_x0_latent_sp.type(self.precision_t))
+-
+-                grad_abs = torch.abs(grad.detach())
+-                norm_grad  = F.interpolate((grad_abs / grad_abs.max()).mean(dim=1,keepdim=True), (resolution[0], resolution[1]), mode='bilinear', align_corners=False).repeat(1,3,1,1)
+-
+-                latents_rgb = F.interpolate(lat2rgb(latents), (resolution[0], resolution[1]), mode='bilinear', align_corners=False)
+-                latents_sp_rgb = F.interpolate(lat2rgb(pred_x0_latent_sp), (resolution[0], resolution[1]), mode='bilinear', align_corners=False)
++        self.brisque_list.append(brisque_score.item())
+ 
+-                viz_images = torch.cat([pred_rgb, 
+-                                        pred_depth.repeat(1, 3, 1, 1), 
+-                                        pred_alpha.repeat(1, 3, 1, 1), 
+-                                        rgb2sat(pred_rgb, pred_alpha).repeat(1, 3, 1, 1),
+-                                        latents_rgb, latents_sp_rgb, 
+-                                        norm_grad,
+-                                        pred_x0_sp, pred_x0_pos],dim=0) 
+-                save_image(viz_images, save_path_iter)
+-
+-
+-        return loss
+-
+-
+-    def train_step(self, text_embeddings, pred_rgb, pred_depth=None, pred_alpha=None,
+-                    grad_scale=1,use_control_net=False,
+-                    save_folder:Path=None, iteration=0, warm_up_rate = 0,
+-                    resolution=(512, 512), guidance_opt=None,as_latent=False, embedding_inverse = None):
+-
+-        pred_rgb, pred_depth, pred_alpha = self.augmentation(pred_rgb, pred_depth, pred_alpha)
++       
+ 
+         B = pred_rgb.shape[0]
+         K = text_embeddings.shape[0] - 1
+@@ -435,35 +382,141 @@ class StableDiffusion(nn.Module):
+ 
+         grad = w(self.alphas[t]) * (pred_noise - target)
+ 
+-        grad = torch.nan_to_num(grad_scale * grad)
+-        loss = SpecifyGradient.apply(latents, grad)
++
++
++         # ========== 新增：判断是否启用 PCA 监督 ==========
++        enable_pca_supervision = False
++        pca_weight = 0.0  # PCA 监督的权重
++        pca_loss = 0.0
++        pca_index = 1000-ind_t
++
++        # 判断 azimuth 是否在论文 back-view bin 内
++        if azimuth >= 120 or azimuth <= -120:
++            enable_pca_supervision = True
++            pca_weight = structural_guidance_weight(azimuth)
++        # ========== 新增 PCA 引导逻辑 ==========
++        if self.brisque_low_count == 1:
++            pca_weight = pca_weight/2
++        elif self.brisque_low_count == 2:
++            pca_weight=0
++
++        if enable_pca_supervision and hasattr(self, 'pca_info'):
++            #print("pca_index is:",pca_index)
++            #print("current iteration is:", iteration)
++            step_pca = self.pca_info.get(pca_index.item(), None)
++            #print("step_pca is ", step_pca)
++            if step_pca:
++                #pca_loss = 0.0
++                count = 0
++                # 遍历当前 step 的所有 PCA 层信息
++                for layer_name, pca_data in step_pca.items():
++                    # 通过名称获取 UNet 中的模块
++                    module = get_module_by_name(self.unet, layer_name)
++                    #print("module is:", module)
++                    if not module:
++                        continue
++
++                    # 提取特征（根据层类型）
++                    if "attentions" in layer_name and hasattr(module.processor, "k"):
++                        feat = module.processor.k  # 注意力层的 key 特征
++                    elif "resnets" in layer_name and hasattr(module, "feature"):
++                        feat = module.feature  # 残差块的自定义特征
++                    else:
++                        continue
++
++                    # 使用文本条件部分（如果启用 CFG）
++                    if guidance_opt.guidance_scale > 1.0:
++                        feat = feat.chunk(2)[1]  # 假设条件部分在第二块
++
++                    # 计算 PCA 投影
++                    bs, c, h, w = feat.shape
++                    feat_2d = feat.permute(0, 2, 3, 1).reshape(-1, c)
++                    
++                    centered = feat_2d - pca_data["mean"].to(feat.device)
++                    proj = centered @ pca_data["basis"].to(feat.device)
++                    #print("proj is:", proj.shape)
++
++                    # 计算 teacher_feat_mean
++                    teacher_feat_ = pca_data["teacher_feature"].to(feat.device)
++                    teacher_feat_mean = mean_teacher_features(
++                        teacher_feat_,
++                        topk=guidance_opt.num_samples_per_group,
++                        tokens_per_sample=proj.shape[0],
++                    )
++                    #print("teacher_feat_mean:", teacher_feat_mean.shape)
++                    # 计算 MSE 损失（与教师特征均值对齐）
++                    loss = F.mse_loss(proj, teacher_feat_mean)
++                    pca_loss += loss
++                    count += 1
++
++                # 计算平均损失并反向传播
+               
+-        if iteration % guidance_opt.vis_interval == 0:
+-            noise_pred_post = noise_pred_uncond + 7.5* delta_DSD    
+-            lat2rgb = lambda x: torch.clip((x.permute(0,2,3,1) @ self.rgb_latent_factors.to(x.dtype)).permute(0,3,1,2), 0., 1.)
+-            save_path_iter = os.path.join(save_folder,"iter_{}_step_{}.jpg".format(iteration,prev_t.item()))
+-            with torch.no_grad():
+-                pred_x0_latent_sp = pred_original(self.scheduler, noise_pred_uncond, prev_t, prev_latents_noisy)    
+-                pred_x0_latent_pos = pred_original(self.scheduler, noise_pred_post, prev_t, prev_latents_noisy)        
+-                pred_x0_pos = self.decode_latents(pred_x0_latent_pos.type(self.precision_t))
+-                pred_x0_sp = self.decode_latents(pred_x0_latent_sp.type(self.precision_t))
+-                # pred_x0_uncond = pred_x0_sp[:1, ...]
+-
+-                grad_abs = torch.abs(grad.detach())
+-                norm_grad  = F.interpolate((grad_abs / grad_abs.max()).mean(dim=1,keepdim=True), (resolution[0], resolution[1]), mode='bilinear', align_corners=False).repeat(1,3,1,1)
+-
+-                latents_rgb = F.interpolate(lat2rgb(latents), (resolution[0], resolution[1]), mode='bilinear', align_corners=False)
+-                latents_sp_rgb = F.interpolate(lat2rgb(pred_x0_latent_sp), (resolution[0], resolution[1]), mode='bilinear', align_corners=False)
+-
+-                viz_images = torch.cat([pred_rgb, 
+-                                        pred_depth.repeat(1, 3, 1, 1), 
+-                                        pred_alpha.repeat(1, 3, 1, 1), 
+-                                        rgb2sat(pred_rgb, pred_alpha).repeat(1, 3, 1, 1),
+-                                        latents_rgb, latents_sp_rgb, norm_grad,
+-                                        pred_x0_sp, pred_x0_pos],dim=0) 
+-                save_image(viz_images, save_path_iter)
+-
+-        return loss
++                if count > 0:
++                    pca_loss = pca_loss / count
++           
++
++        grad = torch.nan_to_num(grad_scale * grad)
++        loss = SpecifyGradient.apply(latents, grad)+ (guidance_opt.pca_guidance_scale * pca_weight)*pca_loss
++
++
++        # ================ 新增：按照角度分类保存 pred_x0_pos ================
++        # 1) 根据当前 azimuth 获取视角类别
++        # 计算生成图像
++        pred_x0_latent_pos = pred_original(self.scheduler, pred_noise, prev_t, prev_latents_noisy)
++        pred_x0_pos = self.decode_latents(pred_x0_latent_pos.type(self.precision_t))
++        
++        target_view = classify_view(azimuth)  # 返回 'front_view' / 'side_view' / 'back_view'
++        
++        # 2) 在 save_folder 下，按视角类别建子文件夹
++        view_folder = os.path.join(save_folder, target_view)
++        os.makedirs(view_folder, exist_ok=True)
++        
++        # 3) 构造保存文件名
++        #    这里示例用 "iter_<iteration>.jpg"，也可包含 step 或 azimuth 信息
++        pred_image_name = f"iter_{iteration}.jpg"
++        pred_image_path = os.path.join(view_folder, pred_image_name)
++        save_image(pred_x0_pos, pred_image_path)
++
++                # # CLIP Method - 只在 iteration <= 2500 时使用
++        is_CLIP_cut = False
++        if 500 < iteration <= 2500:
++                # 图像预处理
++            image_preprocessed = self.tensor_preprocess(pred_x0_pos).to(self.device)
++            
++            # 编码图像
++            image_embeddings = self.clip_model.encode_image(image_preprocessed.half())
++            
++            # 定义所有可能视角（可配置为类变量）
++            view_types = ["front", "side", "back"]
++            assert target_view in view_types, f"Invalid view type: {target_view}"
++            
++            # 生成动态文本提示
++            text_descriptions = [f"a {view} view of an object" for view in view_types]
++            
++            # 批量编码文本
++            text_inputs = self.clip_tokenizer(text_descriptions).to(self.device)
++            text_embeddings = self.clip_model.encode_text(text_inputs)
++            
++            # 计算相似度
++            similarity_scores = torch.nn.functional.cosine_similarity(
++                image_embeddings.unsqueeze(1), 
++                text_embeddings.unsqueeze(0),
++                dim=-1
++            ).squeeze()
++
++            
++            #     动态获取目标索引
++            target_idx = view_types.index(target_view)
++            other_indices = [i for i in range(len(view_types)) if i != target_idx]
++
++            # 计算目标分数和其他分数
++            target_score = similarity_scores[target_idx]
++            other_scores = [similarity_scores[i] for i in other_indices]  # 直接提取其他分数
++
++            # 动态判断逻辑：当存在其他分数且target_score均小于所有其他分数时设为True
++            is_CLIP_cut = bool(other_scores) and all(target_score < s for s in other_scores)
++                    
++        return loss,is_CLIP_cut
+ 
+     def decode_latents(self, latents):
+         target_dtype = latents.dtype
+@@ -484,4 +537,4 @@ class StableDiffusion(nn.Module):
+ 
+         latents = posterior.sample() * self.vae.config.scaling_factor
+ 
+-        return latents.to(target_dtype), kl_divergence
+\ No newline at end of file
++        return latents.to(target_dtype), kl_divergence
+diff --git a/train.py b/train.py
+index b8d1718..e965ad0 100644
+--- a/train.py
++++ b/train.py
+@@ -28,7 +28,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams, GenerateC
+ import math
+ from torchvision.utils import save_image
+ import torchvision.transforms as T
+-
++from guidance.pca_helpers import prep_unet_attention, patch_target_conv_block, get_back_token_index
+ try:
+     from torch.utils.tensorboard import SummaryWriter
+     TENSORBOARD_FOUND = True
+@@ -37,75 +37,6 @@ except ImportError:
+ 
+ 
+ 
+-def adjust_text_embeddings(embeddings, azimuth, guidance_opt):
+-    #TODO: add prenerg functions
+-    text_z_list = []
+-    weights_list = []
+-    K = 0
+-    #for b in range(azimuth):
+-    text_z_, weights_ = get_pos_neg_text_embeddings(embeddings, azimuth, guidance_opt)
+-    K = max(K, weights_.shape[0])
+-    text_z_list.append(text_z_)
+-    weights_list.append(weights_)
+-
+-    # Interleave text_embeddings from different dirs to form a batch
+-    text_embeddings = []
+-    for i in range(K):
+-        for text_z in text_z_list:
+-            # if uneven length, pad with the first embedding
+-            text_embeddings.append(text_z[i] if i < len(text_z) else text_z[0])
+-    text_embeddings = torch.stack(text_embeddings, dim=0) # [B * K, 77, 768]
+-
+-    # Interleave weights from different dirs to form a batch
+-    weights = []
+-    for i in range(K):
+-        for weights_ in weights_list:
+-            weights.append(weights_[i] if i < len(weights_) else torch.zeros_like(weights_[0]))
+-    weights = torch.stack(weights, dim=0) # [B * K]
+-    return text_embeddings, weights
+-
+-def get_pos_neg_text_embeddings(embeddings, azimuth_val, opt):
+-    if azimuth_val >= -90 and azimuth_val < 90:
+-        if azimuth_val >= 0:
+-            r = 1 - azimuth_val / 90
+-        else:
+-            r = 1 + azimuth_val / 90
+-        start_z = embeddings['front']
+-        end_z = embeddings['side']
+-        # if random.random() < 0.3:
+-        #     r = r + random.gauss(0, 0.08)
+-        pos_z = r * start_z + (1 - r) * end_z
+-        text_z = torch.cat([pos_z, embeddings['front'], embeddings['side']], dim=0)
+-        if r > 0.8:
+-            front_neg_w = 0.0
+-        else:
+-            front_neg_w = math.exp(-r * opt.front_decay_factor) * opt.negative_w
+-        if r < 0.2:
+-            side_neg_w = 0.0
+-        else:
+-            side_neg_w = math.exp(-(1-r) * opt.side_decay_factor) * opt.negative_w
+-
+-        weights = torch.tensor([1.0, front_neg_w, side_neg_w])
+-    else:
+-        if azimuth_val >= 0:
+-            r = 1 - (azimuth_val - 90) / 90
+-        else:
+-            r = 1 + (azimuth_val + 90) / 90
+-        start_z = embeddings['side']
+-        end_z = embeddings['back']
+-        # if random.random() < 0.3:
+-        #     r = r + random.gauss(0, 0.08)
+-        pos_z = r * start_z + (1 - r) * end_z
+-        text_z = torch.cat([pos_z, embeddings['side'], embeddings['front']], dim=0)
+-        front_neg_w = opt.negative_w 
+-        if r > 0.8:
+-            side_neg_w = 0.0
+-        else:
+-            side_neg_w = math.exp(-r * opt.side_decay_factor) * opt.negative_w / 2
+-
+-        weights = torch.tensor([1.0, side_neg_w, front_neg_w])
+-    return text_z, weights.to(text_z.device)
+-
+ def prepare_embeddings(guidance_opt, guidance):
+     embeddings = {}
+     # text embeddings (stable-diffusion) and (IF)
+@@ -117,6 +48,17 @@ def prepare_embeddings(guidance_opt, guidance):
+     embeddings['inverse_text'] = guidance.get_text_embeds(guidance_opt.inverse_text)
+     return embeddings
+ 
++def prepare_initial_embeddings(guidance_opt, guidance):
++    embeddings = {}
++    # text embeddings (stable-diffusion) and (IF)
++    embeddings['default'] = guidance.get_text_embeds([guidance_opt.initial_text])
++    embeddings['uncond'] = guidance.get_text_embeds([guidance_opt.negative])
++
++    for d in ['front', 'side', 'back']:
++        embeddings[d] = guidance.get_text_embeds([f"{guidance_opt.initial_text}, {d} view"])
++    embeddings['inverse_text'] = guidance.get_text_embeds(guidance_opt.inverse_text)
++    return embeddings
++
+ def guidance_setup(guidance_opt):
+     if guidance_opt.guidance=="SD":
+         from guidance.sd_utils import StableDiffusion
+@@ -127,13 +69,35 @@ def guidance_setup(guidance_opt):
+                                    textual_inversion_path = guidance_opt.textual_inversion_path,
+                                    LoRA_path = guidance_opt.LoRA_path,
+                                    guidance_opt=guidance_opt)
++                                   
++        target_idx = get_back_token_index(guidance, guidance_opt.initial_text)
++
++
++        new_processor = prep_unet_attention(
++            guidance.unet,
++            detach_key=True,
++            target_blocks="up_blocks.1",
++            target_word_idx=target_idx,
++            boost_factor=200 # 可配置参数
++        )
++        new_processor.set_target_index(target_idx)
++        
++        patch_target_conv_block(
++            unet=guidance.unet,
++            module_name="up_blocks.1.resnets.1",
++            detach_feature=True
++        )
++        
++
++        guidance.load_pca_info(guidance_opt.pca_result)
++
+     else:
+         raise ValueError(f'{guidance_opt.guidance} not supported.')
+     if guidance is not None:
+         for p in guidance.parameters():
+             p.requires_grad = False
+-    embeddings = prepare_embeddings(guidance_opt, guidance)
+-    return guidance, embeddings
++    embeddings = prepare_initial_embeddings(guidance_opt, guidance)
++    return guidance, embeddings,new_processor
+ 
+ 
+ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, save_video):
+@@ -159,7 +123,7 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
+     #controlnet
+     use_control_net = False
+     #set up pretrain diffusion models and text_embedings 
+-    guidance, embeddings = guidance_setup(guidance_opt)   
++    guidance, embeddings,new_processor = guidance_setup(guidance_opt)   
+     viewpoint_stack = None
+     viewpoint_stack_around = None
+     ema_loss_for_log = 0.0
+@@ -174,7 +138,17 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
+         save_process_iter = opt.iterations // len(process_view_points)
+         pro_img_frames = []
+ 
+-    for iteration in range(first_iter, opt.iterations + 1):        
++    check_if_change_prompt = False
++
++    for iteration in range(first_iter, opt.iterations + 1):
++        
++        #upgrade prompts
++        if iteration >=800 and not check_if_change_prompt:
++            check_if_change_prompt = True
++            target_idx = get_back_token_index(guidance, guidance_opt.text)
++            new_processor.set_target_index(target_idx)
++            embeddings = prepare_embeddings(guidance_opt, guidance)
++        #print("current target index is:",new_processor.get_index())
+         #TODO: DEBUG NETWORK_GUI
+         if network_gui.conn == None:
+             network_gui.try_connect()
+@@ -248,32 +222,49 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
+             azimuth = viewpoint_cam.delta_azimuth
+             text_z = [embeddings['uncond']]
+ 
+-
+-            if guidance_opt.perpneg:
+-                text_z_comp, weights = adjust_text_embeddings(embeddings, azimuth, guidance_opt)
+-                text_z.append(text_z_comp)
+-                weights_.append(weights)
+-
+-            else:                
+-                if azimuth >= -90 and azimuth < 90:
+-                    if azimuth >= 0:
+-                        r = 1 - azimuth / 90
+-                    else:
+-                        r = 1 + azimuth / 90
+-                    start_z = embeddings['front']
+-                    end_z = embeddings['side']
++            #prep embedding
++    
++            if azimuth >= -90 and azimuth < 90:
++               
++                if azimuth >= 0:
++                    r = 1 - azimuth / 90
+                 else:
+-                    if azimuth >= 0:
+-                        r = 1 - (azimuth - 90) / 90
+-                    else:
+-                        r = 1 + (azimuth + 90) / 90
+-                    start_z = embeddings['side']
+-                    end_z = embeddings['back']
+-                text_z.append(r * start_z + (1 - r) * end_z)
++                    r = 1 + azimuth / 90
++                start_z = embeddings['front']
++                end_z = embeddings['side']
++            else:
++                if azimuth >= 0:
++                    r = 1 - (azimuth - 90) / 90
++                else:
++                    r = 1 + (azimuth + 90) / 90
++                start_z = embeddings['side']
++                end_z = embeddings['back']
++            text_z.append(r * start_z + (1 - r) * end_z)
+ 
+             text_z = torch.cat(text_z, dim=0)
+             text_z_.append(text_z)
+ 
++
++            cross_attention_weight =1
++             # 根据 azimuth 设置权重
++            if -30 <= azimuth <= 30 :
++                cross_attention_weight = 1.0  # 不调整权重
++            elif (30 < azimuth <= 100) or (-100 <= azimuth <= -30):
++                cross_attention_weight = 60.0
++            else:
++                cross_attention_weight = 120.0
++
++
++            new_processor.set_boost_factor(cross_attention_weight)
++
++            # if(iteration > 300):
++            #     new_processor.set_boost_factor(1.0)
++            
++            # print("current angle is:", azimuth)
++            # print("current weight is:", new_processor.get_weight())
++            # print("current index is:", new_processor.get_index())
++ 
++
+             # Render
+             if (iteration - 1) == debug_from:
+                 pipe.debug = True
+@@ -303,21 +294,34 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
+             _aslatent=True
+         if iteration > opt.use_control_net_iter and (random.random() < guidance_opt.controlnet_ratio):
+                 use_control_net = True
+-        if guidance_opt.perpneg:
+-            loss = guidance.train_step_perpneg(torch.stack(text_z_, dim=1), images, 
+-                                                pred_depth=depths, pred_alpha=alphas,
+-                                                grad_scale=guidance_opt.lambda_guidance,
+-                                                use_control_net = use_control_net ,save_folder = save_folder,  iteration = iteration, warm_up_rate=warm_up_rate, 
+-                                                weights = torch.stack(weights_, dim=1), resolution=(gcams.image_h, gcams.image_w),
+-                                                guidance_opt=guidance_opt,as_latent=_aslatent, embedding_inverse = text_z_inverse)
+-        else:
+-            loss = guidance.train_step(torch.stack(text_z_, dim=1), images, 
+-                                    pred_depth=depths, pred_alpha=alphas,
+-                                    grad_scale=guidance_opt.lambda_guidance,
+-                                    use_control_net = use_control_net ,save_folder = save_folder,  iteration = iteration, warm_up_rate=warm_up_rate, 
+-                                    resolution=(gcams.image_h, gcams.image_w),
+-                                    guidance_opt=guidance_opt,as_latent=_aslatent, embedding_inverse = text_z_inverse)
+-            #raise ValueError(f'original version not supported.')
++   
++
++        #based on image quilty to change weight
++        if len(guidance.brisque_list)>50 and guidance.brisque_low_count <= 2:
++            recent_scores = guidance.brisque_list[-50:]
++            # 计算平均值
++            avg_score = sum(recent_scores) / len(recent_scores)
++            if avg_score < 75:
++                guidance.brisque_low_count = guidance.brisque_low_count+1
++                if guidance.brisque_low_count == 1:
++                    new_processor.set_boost_factor(max(1, cross_attention_weight//2))
++
++                elif guidance.brisque_low_count == 2:
++                    new_processor.set_boost_factor(max(1, cross_attention_weight//3))
++
++        #trainning entry
++        loss,is_CLIP_cut = guidance.train_step(torch.stack(text_z_, dim=1), images, 
++                                pred_depth=depths, pred_alpha=alphas,
++                                grad_scale=guidance_opt.lambda_guidance,
++                                use_control_net = use_control_net ,save_folder = save_folder,  iteration = iteration, warm_up_rate=warm_up_rate, 
++                                resolution=(gcams.image_h, gcams.image_w),
++                                guidance_opt=guidance_opt,as_latent=_aslatent, embedding_inverse = text_z_inverse, azimuth=azimuth)
++        #raise ValueError(f'original version not supported.')
++        if is_CLIP_cut:
++            #print("cut curent azimuth is:",azimuth)
++            iterationo = iteration-1
++            continue
++
+         scales = torch.stack(scales, dim=0)
+ 
+         loss_scale = torch.mean(scales,dim=-1).mean()
+diff --git a/train.sh b/train.sh
+index d01e53f..98a0098 100644
+--- a/train.sh
++++ b/train.sh
+@@ -1,2 +1,2 @@
+ export CUDA_VISIBLE_DEVICES="0"
+-python train.py --opt './configs/bagel.yaml'
++python train.py --opt './configs/baby_dragon.yaml'

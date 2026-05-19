@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--image_dir", type=str, default=None, help="final_image_0.png 所在目录")
     parser.add_argument("--num_images", type=int, default=20, help="图片数量，默认20张")
     parser.add_argument("--batch_size", type=int, default=20, help="生成时的批大小")
-    parser.add_argument("--topk", type=int, default=5, help="取背面差值最高的图片数")
+    parser.add_argument("--topk", type=int, default=3, help="取背面差值最高的图片数")
     parser.add_argument("--pca_path", type=str, default=None, help="原始 pca_results.pt 路径")
     parser.add_argument("--save_path", type=str, default=None, help="处理后保存的文件目录")
     args = parser.parse_args()
@@ -99,13 +99,13 @@ def main():
     # -----------------------
     # 新增：将前 topk 个图片的文件名和背面差值保存到 txt 文件中
     # -----------------------
-    results_txt_path = os.path.join(args.save_path, "top5_results.txt")
+    results_txt_path = os.path.join(args.save_path, f"top{args.topk}_results.txt")
     with open(results_txt_path, "w", encoding="utf-8") as f:
         f.write("最符合背面视角的图片：\n")
         for rank, (idx, val) in enumerate(zip(topk_indices, topk_vals), start=1):
             image_name = os.path.basename(filenames[idx])
             f.write(f"[Rank {rank}] File: {image_name}, score_diff: {val:.4f}\n")
-    print(f"已保存 top5 图片信息到 {results_txt_path}")
+    print(f"已保存 top{args.topk} 图片信息到 {results_txt_path}")
 
     # -----------------------
     # Part 2: 加载 pca_results.pt，保留 topk 索引
@@ -143,7 +143,7 @@ def main():
     # -----------------------
     # Part 3: 保存更新后的 pca_results
     # -----------------------
-    pca_save_path = os.path.join(args.save_path, "top5_pca.pt")
+    pca_save_path = os.path.join(args.save_path, f"top{args.topk}_pca.pt")
     torch.save(pca_results, pca_save_path)
     print(f"\n处理完成，新的 PCA 结果已保存到 {pca_save_path}")
 

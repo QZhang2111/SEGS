@@ -1,5 +1,80 @@
-# 忽略 PyTorch 相关缓存目录（根据实际情况调整路径）
-cache/
-torch_cache/
+# OS/editor metadata
+.DS_Store
+._*
+__MACOSX/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python caches/build products
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local environments
+.env
+.env.*
+.venv/
+venv/
+env/
+conda-meta/
+
+# Recovered/local upstream artifacts; keep out of public repo
+LucidDreamer/
+LucidDreamer.zip
+PCA_LucidDreamer.zip
+*.zip
+
+# Generated SEGS data and experiment outputs
+pca_output/
+pca_result/
+PCA_Guidance_Results/
+outputs/
+output/
+logs/
+log/
+runs/
+wandb/
+checkpoints/
+workspace/
+workspaces/
+results/
+tmp/
+temp/
+
+# Model weights, generated features, rendered assets
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.npz
+*.npy
+*.ply
+*.obj
+*.glb
+*.mp4
+*.mov
+*.gif
+
+# CUDA/native extension build products
+*.so
+*.dylib
+*.o
+*.cu.o
+*.egg
+submodules/*/build/
+submodules/*/*.egg-info/
+
+# Generated integration configs
+configs/generated/
+LucidDreamer/configs/generated/

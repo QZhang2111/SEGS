@@ -28,6 +28,11 @@ def generate_yaml(base_yaml_path, output_yaml_path, text, initial_text, pca_resu
         yaml.dump(base_config, f)
 
 def main():
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parent)
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = repo_root if not current_pythonpath else f"{repo_root}{os.pathsep}{current_pythonpath}"
+
     # 读取JSON文件
     with open("simplified_prompts.json") as f:
         data1 = json.load(f)
@@ -65,7 +70,7 @@ def main():
         print(f"\n运行第一个脚本: 提示词 '{prompt1}'")
         print("命令:", " ".join(cmd1))
         try:
-            subprocess.run(cmd1, check=True)
+            subprocess.run(cmd1, check=True, env=env)
         except subprocess.CalledProcessError as e:
             print(f"第一个脚本运行失败: {e}")
             continue
@@ -85,12 +90,13 @@ def main():
             "pca/CLIP_Extract_PCA_Info.py",
             "--image_dir", save_folder,
             "--pca_path", pca_path,
-            "--save_path", pca_result_subfolder
+            "--save_path", pca_result_subfolder,
+            "--topk", "3",
         ]
         print(f"\n运行第二个脚本: 使用前缀 '{folder_name}'")
         print("命令:", " ".join(cmd2))
         try:
-            subprocess.run(cmd2, check=True)
+            subprocess.run(cmd2, check=True, env=env)
         except subprocess.CalledProcessError as e:
             print(f"第二个脚本运行失败: {e}")
             continue
@@ -98,7 +104,7 @@ def main():
         # 生成YAML配置文件
         yaml_filename = f"{folder_name}.yaml"
         yaml_path = os.path.join(generated_yaml_dir, yaml_filename)
-        pca_result_pt = os.path.join(pca_result_subfolder, "top5_pca.pt")
+        pca_result_pt = os.path.join(pca_result_subfolder, "top3_pca.pt")
         
         generate_yaml(
             base_yaml_path=base_yaml_path,
@@ -112,10 +118,11 @@ def main():
         print(f"生成YAML文件: {yaml_path}")
 
         # 运行训练脚本
-        cmd_train = f'export CUDA_VISIBLE_DEVICES="0" && python LucidDreamer/train.py --opt "{yaml_path}"'
+        env["CUDA_VISIBLE_DEVICES"] = "0"
+        cmd_train = ["python", "LucidDreamer/train.py", "--opt", yaml_path]
         print(f"运行训练脚本: {cmd_train}")
         try:
-            subprocess.run(cmd_train, shell=True, check=True)
+            subprocess.run(cmd_train, check=True, env=env)
         except subprocess.CalledProcessError as e:
             print(f"训练脚本运行失败: {e}")
             continue
