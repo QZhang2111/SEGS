@@ -34,7 +34,7 @@ Default prototype settings follow the paper implementation:
 | Selected target-view references | `topk=3` |
 | PCA feature dimension | `64` |
 | Target view | back view |
-| Back-view azimuth bin | `|azimuth| >= 120` |
+| Back-view azimuth bin | `azimuth >= 120` |
 | Default diffusion backbone | `stabilityai/stable-diffusion-2-1-base` |
 
 ## Repository Layout
