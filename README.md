@@ -124,3 +124,15 @@ Third-party code and model dependencies may have separate licenses. See [third_p
 ## Acknowledgements
 
 The Gaussian text-to-3D integration route is adapted from EnVision-Research/LucidDreamer. SEGS also builds on the broader SDS/VSD text-to-3D ecosystem, including Diffusers, OpenCLIP, and Gaussian Splatting implementations.
+
+## Citation
+The paper can be downloaded from [arXiv](https://arxiv.org/abs/2605.19876).
+If you find our paper/code is useful, you could cite:
+```
+@article{zhang2026structural,
+  title={Structural Energy Guidance for View-Consistent Text-to-3D Generation},
+  author={Zhang, Qing and Tong, Jinguang and Zhang, Jing and Hong, Jie and Li, Xuesong},
+  journal={arXiv preprint arXiv:2605.19876},
+  year={2026}
+}
+```
